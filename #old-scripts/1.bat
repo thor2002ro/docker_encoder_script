@@ -1,0 +1,1 @@
+for %%i in (*.mp4) do ffmpeg.exe -n -i %%i -vf scale=3840:2160 -c:v hevc_amf -profile:v main -qmin 24 -qmax 28 -b:v 3000k -maxrate 10000k -rc-lookahead 32 -g 250 -c:a copy -c:s copy -map 0 1\%%i
