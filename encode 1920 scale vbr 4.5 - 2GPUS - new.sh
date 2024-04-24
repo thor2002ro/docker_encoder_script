@@ -1,5 +1,29 @@
 #!/bin/sh
 
+# Function to print script usage
+print_usage() {
+    echo "Usage: $0 [-software]"
+    echo "Options:"
+    echo "  -software: Use software encoding instead of hardware acceleration"
+    exit 1
+}
+
+# Parse command line options
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -software) software_mode=true;;
+        *) echo "Unknown parameter passed: $1"; print_usage;;
+    esac
+    shift
+done
+
+#nr of containers per gpu
+container_nr=2
+
+# Check if the number of containers is limited
+if [[ -n $software_mode ]]; then
+    container_nr=2	
+fi
 #docker container stop $(docker container ls -q --filter name="ffmpeg*")
 
 # Set permissions on GPU devices
@@ -16,9 +40,6 @@ mkdir -p "$LOG_DIR"
 total_cores=$(nproc)
 num_cores=$((total_cores/2))
 echo "nr cores used: $num_cores"
-
-#nr of containers per gpu
-container_nr=2
 
 # Declare GPU Devices
 gpu1="/dev/dri/renderD129"  #vega56
@@ -64,19 +85,22 @@ find_video_files() {
 }
 
 
-# Function to check the number of running Docker containers for a given GPU
+# Function to check the number of running Docker containers for a given GPU or for software encoding (noGPU)
 check_running_containers() {
   local gpu_number=""
   if [ "$1" = "$gpu1" ]; then
     gpu_number="GPU1"
   elif [ "$1" = "$gpu2" ]; then
     gpu_number="GPU2"
+  else
+    gpu_number="noGPU"
   fi
 
   local running_containers=$(docker ps --filter "name=ffmpeg_${gpu_number}_" --format '{{.Names}}' | wc -l)
   #echo "Running containers for $gpu_number: $running_containers"
   echo "$running_containers"
 }
+
 
 # Function for video encoding using VA-API
 encode_vaapi () {
@@ -160,6 +184,63 @@ encode_vaapi () {
     fi
 }
 
+encode_software() {
+    echo "-----------------------------"
+    if [[ -f "$2" ]]; then
+        local filename=$(basename "$2")
+        local original_extension="${filename##*.}"
+        local file_extension="$original_extension"
+
+        local gpu_number="noGPU"
+
+        # Change the file extension to "mp4" if it is originally "m2ts"
+        [[ "$original_extension" = "m2ts" ]] && file_extension="mkv"
+
+        echo "$(date +"%Y-%m-%d %H:%M:%S") - Encoding video: $2 change to: $file_extension"
+
+        local relative_path=""
+        if [[ "$(dirname "$2")" != "$input_dir" ]]; then
+            relative_path=$(dirname "$2" | sed -e "s|^$input_dir/||")
+        fi
+
+        local log_file="$LOG_DIR/${filename%.*}.log"
+
+        container_count=$((container_count + 1))
+
+        # Check the aspect ratio of the input video
+        local aspect_ratio=$(docker run --rm -v $PWD:/media -w /media --network none --entrypoint ffprobe ffmpeg-vaapi -v error -select_streams v:0 -show_entries stream=display_aspect_ratio -of csv=p=0 "$2")
+
+        echo "Aspect Ratio: $aspect_ratio"
+
+        # Use a conditional to determine if the scaling filter is needed
+        local scale_filter="-vf scale=1920:-2"
+        numerator=$(echo "$aspect_ratio" | awk -F: '{print $1}')
+        denominator=$(echo "$aspect_ratio" | awk -F: '{print $2}')
+
+       if (( numerator > denominator )); then
+            # Landscape orientation
+            scale_filter="-vf scale=1920:-2"
+        else
+            # Portrait orientation
+            scale_filter="-vf scale=1080:-2"
+        fi
+
+        local codec_mode="-c:v libx265 -crf 25 -preset medium"
+
+        # Construct the docker run command string
+        docker_run_cmd="docker run --rm -v \"$PWD\":/media -w /media --network none --name \"ffmpeg_${gpu_number}_${container_count}\" ffmpeg-vaapi -stats \
+            -hide_banner -loglevel info \
+            -n -i \"$2\" \
+            $scale_filter \
+            $codec_mode \
+            -c:a aac -c:s copy -map 0:v -map 0:a -map 0:s? \"1/$relative_path/${filename%.*}.${file_extension}\" > \"$log_file\" 2>&1 &"
+
+        # Execute the docker run command
+        eval "$docker_run_cmd"
+    fi
+}
+
+
 # Function to set the GPU power state (commented out for now)
 # set_gpu_powerstate() {
 #   local card_number=$1
@@ -184,36 +265,47 @@ i=0
 create_output_structure "$input_dir"
 
 while [ $i -lt $total_files ]; do
-    # Launch up to four encoding processes (two for each GPU) if there are files left
-    running_containers_gpu1=$(check_running_containers $gpu1)
-    running_containers_gpu2=$(check_running_containers $gpu2)
-
-    #echo "Number of video files found: "${files[$i]}""
-
-    if [ $running_containers_gpu1 -lt $container_nr ] && [ $i -lt $total_files ]; then
-        encode_vaapi $gpu1 "${files[$i]}"
-        sleep 1
-        i=$((i+1))
-    fi
-    
-    if [ $running_containers_gpu2 -lt $container_nr ] && [ $i -lt $total_files ]; then
-        encode_vaapi $gpu2 "${files[$i]}"
-        sleep 1
-        i=$((i+1))
-    fi
-
-    if [ $running_containers_gpu1 -ge $container_nr ] || [ $running_containers_gpu2 -ge $container_nr ]; then
-        # Wait for any of the encoding processes to finish
-        wait -n
+    if [[ -n $software_mode ]]; then
+        # For software encoding mode
+        running_containers_noGPU=$(check_running_containers noGPU)
+        if [ $running_containers_noGPU -lt $container_nr ] && [ $i -lt $total_files ]; then
+            encode_software "noGPU" "${files[$i]}"
+            sleep 1
+            i=$((i+1))
+        else
+            # Wait for any of the encoding processes to finish
+            wait -n
+            running_containers_noGPU=$(check_running_containers noGPU)
+        fi
+    else
+        # For hardware acceleration mode
+        # Launch up to four encoding processes (two for each GPU) if there are files left
         running_containers_gpu1=$(check_running_containers $gpu1)
         running_containers_gpu2=$(check_running_containers $gpu2)
+
+        if [ $running_containers_gpu1 -lt $container_nr ] && [ $i -lt $total_files ]; then
+            encode_vaapi $gpu1 "${files[$i]}"
+            sleep 1
+            i=$((i+1))
+        fi
+
+        if [ $running_containers_gpu2 -lt $container_nr ] && [ $i -lt $total_files ]; then
+            encode_vaapi $gpu2 "${files[$i]}"
+            sleep 1
+            i=$((i+1))
+        fi
+
+        if [ $running_containers_gpu1 -ge $container_nr ] || [ $running_containers_gpu2 -ge $container_nr ]; then
+            # Wait for any of the encoding processes to finish
+            wait -n
+            running_containers_gpu1=$(check_running_containers $gpu1)
+            running_containers_gpu2=$(check_running_containers $gpu2)
+        fi
     fi
 
     # If any process finished, loop will continue and launch new processes
 done
 
-# Wait for all remaining encoding processes to finish
-wait
 
 # Uncomment the following lines if you want to set GPU power states
 # set_gpu_powerstate 0 low
