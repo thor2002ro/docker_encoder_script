@@ -17,6 +17,9 @@ total_cores=$(nproc)
 num_cores=$((total_cores/2))
 echo "nr cores used: $num_cores"
 
+#nr of containers per gpu
+container_nr=2
+
 # Declare GPU Devices
 gpu1="/dev/dri/renderD129"  #vega56
 gpu2="/dev/dri/renderD128"  #rx560
@@ -117,7 +120,7 @@ encode_vaapi () {
         echo "Aspect Ratio: $aspect_ratio"
 
         # Use a conditional to determine if the scaling filter is needed
-        local scale_filter=""
+        local scale_filter="-filter_hw_device amd0 -vf 'format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-16:format=nv12' -noautoscale"
         numerator=$(echo "$aspect_ratio" | awk -F: '{print $1}')
         denominator=$(echo "$aspect_ratio" | awk -F: '{print $2}')
 
@@ -187,19 +190,19 @@ while [ $i -lt $total_files ]; do
 
     #echo "Number of video files found: "${files[$i]}""
 
-    if [ $running_containers_gpu1 -lt 2 ] && [ $i -lt $total_files ]; then
+    if [ $running_containers_gpu1 -lt $container_nr ] && [ $i -lt $total_files ]; then
         encode_vaapi $gpu1 "${files[$i]}"
         sleep 1
         i=$((i+1))
     fi
     
-    if [ $running_containers_gpu2 -lt 2 ] && [ $i -lt $total_files ]; then
+    if [ $running_containers_gpu2 -lt $container_nr ] && [ $i -lt $total_files ]; then
         encode_vaapi $gpu2 "${files[$i]}"
         sleep 1
         i=$((i+1))
     fi
 
-    if [ $running_containers_gpu1 -ge 2 ] || [ $running_containers_gpu2 -ge 2 ]; then
+    if [ $running_containers_gpu1 -ge $container_nr ] || [ $running_containers_gpu2 -ge $container_nr ]; then
         # Wait for any of the encoding processes to finish
         wait -n
         running_containers_gpu1=$(check_running_containers $gpu1)
