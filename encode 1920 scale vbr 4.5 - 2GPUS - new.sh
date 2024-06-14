@@ -22,7 +22,7 @@ container_nr=2
 
 # Check if the number of containers is limited
 if [[ -n $software_mode ]]; then
-    container_nr=2	
+    container_nr=2  
 fi
 #docker container stop $(docker container ls -q --filter name="ffmpeg*")
 
@@ -32,7 +32,7 @@ chmod -R 0777 /dev/dri/*
 # Initialize variables
 container_count=0
 input_dir="input"
-LOG_DIR="1/#LOGS/logs_$(date +"%Y-%m-%d_%H-%M")"
+LOG_DIR="#LOGS/logs_$(date +"%Y-%m-%d_%H-%M")"
 mkdir 1
 mkdir -p "$LOG_DIR"
 
@@ -63,14 +63,15 @@ check_vaapi_device "$gpu2"
 # Function to create output directory structure based on input directory
 create_output_structure() {
     local input_dir="$1"
-    local output_dir="1"
+    local output_dir="$2"
     
-    # Recreate the directory structure in the output directory without the input directory
-    while IFS= read -r -d '' dir; do
-        dir="${dir#$input_dir/}" # Remove input directory from the path
-        mkdir -p "$output_dir/${dir%/*}" # Create parent directory
-    done < <(find "$input_dir" -mindepth 1 -type d -print0)
+    # Recreate the directory structure in the output directory
+    find "$input_dir" -type d -print0 | while IFS= read -r -d '' dir; do
+        local relative_dir="${dir#$input_dir/}" # Remove input directory from the path
+        mkdir -p "$output_dir/$relative_dir" # Create the full directory structure
+    done
 }
+
 
 # Function to find video files in the input directory and its subdirectories
 find_video_files() {
@@ -171,14 +172,15 @@ encode_vaapi () {
             -hwaccel_output_format vaapi \
             -init_hw_device vaapi=amd0:\"$1\" \
             -n -i \"$2\" \
-            -c:v hevc_vaapi \
+            -c:v:0 hevc_vaapi \
             $scale_filter \
             $codec_mode -strict unofficial \
             -profile:v main \
             -threads \"$num_cores\" \
             -max_muxing_queue_size 2048 \
-            -c:a aac -c:s copy -map 0:v -map 0:a -map 0:s? \"1/$relative_path/${filename%.*}.${file_extension}\" > \"$log_file\" 2>&1 &"
+            -c:a aac -c:s copy \"1/$relative_path/${filename%.*}.${file_extension}\" > \"$log_file\" 2>&1 &"
 
+        #-map 0:v -map 0:a -map 0:s?
         # Execute the docker run command
         eval "$docker_run_cmd"
     fi
@@ -225,7 +227,7 @@ encode_software() {
             scale_filter="-vf scale=1080:-2"
         fi
 
-        local codec_mode="-c:v libx265 -crf 25 -preset medium"
+        local codec_mode="-c:v:0 libx265 -crf 25 -preset medium"
 
         # Construct the docker run command string
         docker_run_cmd="docker run --rm -v \"$PWD\":/media -w /media --network none --name \"ffmpeg_${gpu_number}_${container_count}\" ffmpeg-vaapi -stats \
@@ -233,7 +235,7 @@ encode_software() {
             -n -i \"$2\" \
             $scale_filter \
             $codec_mode \
-            -c:a aac -c:s copy -map 0:v -map 0:a -map 0:s? \"1/$relative_path/${filename%.*}.${file_extension}\" > \"$log_file\" 2>&1 &"
+            -c:a aac -c:s copy \"1/$relative_path/${filename%.*}.${file_extension}\" > \"$log_file\" 2>&1 &"
 
         # Execute the docker run command
         eval "$docker_run_cmd"
@@ -256,18 +258,18 @@ encode_software() {
 # }
 
 # Main Encoding Loop:
-IFS=$'\n' read -r -d '' -a files < <(find_video_files "$input_dir" && printf '\0')
+IFS=$'\n' read -r -d '' -a files < <(find_video_files "$input_dir")
 total_files="${#files[*]}"
 echo "Number of video files found: $total_files"
 i=0
 
 # Create the output directory structure before encoding
-create_output_structure "$input_dir"
+create_output_structure "$input_dir" "1/"
 
 while [ $i -lt $total_files ]; do
     if [[ -n $software_mode ]]; then
         # For software encoding mode
-        running_containers_noGPU=$(check_running_containers noGPU)
+        running_containers_noGPU=$(check_running_containers "noGPU")
         if [ $running_containers_noGPU -lt $container_nr ] && [ $i -lt $total_files ]; then
             encode_software "noGPU" "${files[$i]}"
             sleep 1
@@ -275,7 +277,7 @@ while [ $i -lt $total_files ]; do
         else
             # Wait for any of the encoding processes to finish
             wait -n
-            running_containers_noGPU=$(check_running_containers noGPU)
+            running_containers_noGPU=$(check_running_containers "noGPU")
         fi
     else
         # For hardware acceleration mode
