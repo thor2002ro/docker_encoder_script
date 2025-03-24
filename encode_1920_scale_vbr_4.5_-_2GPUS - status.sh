@@ -2,9 +2,10 @@
 
 # Function to print script usage
 print_usage() {
-    echo "Usage: $0 [-software]"
+    echo "Usage: $0 [-software] [-vr]"
     echo "Options:"
     echo "  -software: Use software encoding instead of hardware acceleration"
+    echo "  -vr: Process VR videos to 2D"
     exit 1
 }
 
@@ -12,6 +13,7 @@ print_usage() {
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -software) software_mode=true;;
+        -vr) vr_mode=true;;
         *) echo "Unknown parameter passed: $1"; print_usage;;
     esac
     shift
@@ -28,8 +30,13 @@ chmod -R 0777 /dev/dri/*
 
 # Initialize variables
 container_count=0
-input_dir="input"
-output_dir="1"
+if [[ -n $vr_mode ]]; then
+    input_dir="input-vr"
+    output_dir="1-vr"
+else
+    input_dir="input"
+    output_dir="1"
+fi
 log_dir="#LOGS/logs_$(date +"%Y-%m-%d_%H-%M")"
 
 mkdir -p "$output_dir"
@@ -81,6 +88,7 @@ check_running_containers() {
 
 get_aspect_ratio() {
     if [[ -f "$1" ]]; then
+        sleep 1
         docker run --rm -v "$PWD":/media -w /media --network none --entrypoint ffprobe ffmpeg-vaapi \
             -v error -select_streams v:0 -show_entries stream=display_aspect_ratio -of csv=p=0 "$1"
     fi
@@ -89,17 +97,23 @@ get_aspect_ratio() {
 # List to track active containers
 declare -A active_containers
 
-# Function to handle Ctrl+C
+# Function to handle Ctrl+C (SIGINT)
 cleanup_on_abort() {
     echo "Stopping running FFmpeg containers..."
+    
+    # Stop all actively tracked containers and delete their incomplete output files
     for container_name in "${!active_containers[@]}"; do
         if docker ps --filter "name=$container_name" -q | grep -q .; then
             docker stop "$container_name"
             output_file="${active_containers[$container_name]}"
-            [[ -f "$output_file" ]] && rm -f "$output_file"
+            if [[ -f "$output_file" ]]; then
+                echo "Deleting incomplete file: $output_file"
+                rm -f "$output_file"
+            fi
         fi
     done
-    exit 1
+
+    exit 1  # Exit with an error code
 }
 trap cleanup_on_abort SIGINT SIGTERM
 
@@ -114,29 +128,45 @@ encode_vaapi() {
     local gpu_name="GPU1"
     [[ "$gpu_device" == "$gpu2" ]] && gpu_name="GPU2"
 
-    # Aspect ratio check
-    local aspect_ratio=$(get_aspect_ratio "$input_file")
-    
-    local scale_filter="-filter_hw_device amd0 -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2 -noautoscale"
-    numerator=$(echo "$aspect_ratio" | awk -F: '{print $1}')
-    denominator=$(echo "$aspect_ratio" | awk -F: '{print $2}')
-
-    if (( numerator > denominator )); then
-        scale_filter="-filter_hw_device amd0 -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2 -noautoscale"
+    local scale_filter=""
+    if [[ -n $vr_mode ]]; then
+        #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=125:w=1920:h=1080:pitch=-30,scale=1920:1080,format=nv12,hwupload"
+        #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=125:w=1920:h=1080:pitch=-30,format=nv12,hwupload"
+        #scale_filter="v360=input=equirect:output=flat:ih_fov=180:iv_fov=180:h_fov=93:v_fov=110:in_stereo=sbs:w=1920:h=-1,format=nv12,hwupload"
+        #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=150:w=1920:h=1080,format=nv12,hwupload"
+        scale_filter="-noautoscale -vf v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=143,format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+        #scale_filter="v360=input=equirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=153:w=1920:h=1080,format=nv12,hwupload"
     else
-        scale_filter="-filter_hw_device amd0 -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1080:h=-2:format=nv12:mode=2 -noautoscale"
+        # Aspect ratio check
+        local aspect_ratio=$(get_aspect_ratio "$input_file")
+    
+        scale_filter="-filter_hw_device amd0 -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+        local numerator=$(echo "$aspect_ratio" | awk -F: '{print $1}')
+        local denominator=$(echo "$aspect_ratio" | awk -F: '{print $2}')
+
+        if (( numerator > denominator )); then
+            scale_filter="-filter_hw_device amd0 -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+        else
+            scale_filter="-filter_hw_device amd0 -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1080:h=-2:format=nv12:mode=2"
+        fi
     fi
 
-    local codec_mode="-qp 27 -bf 0 -preset medium -compression_level 1"
+    #-rc_mode VBR -b:v 4.5M -maxrate 9M \  -map 0
+
+    local codec_mode=""
+    #codec_mode="-rc_mode CQP -qp 26 -compression_level 1"
+    #codec_mode="-rc_mode CQP -global_quality 24 -compression_level 1 "
+    #codec_mode="-rc_mode VBR -b:v 1.5M -maxrate 5M -compression_level 1"
+    codec_mode="-qp 27 -bf 0 -preset medium -compression_level 1"
 
     container_count=$((container_count + 1))
     local container_name="ffmpeg_${gpu_name}_${container_count}"
     active_containers["$container_name"]="$output_path"
 
     docker run --rm --device /dev/dri -v "$PWD":/media -w /media --network none --name "$container_name" ffmpeg-vaapi \
-        -hide_banner -loglevel info -hwaccel vaapi -hwaccel_output_format vaapi \
+        -hide_banner -loglevel info -hwaccel vaapi \
         -init_hw_device vaapi=amd0:"$gpu_device" -i "$input_file" \
-        -c:v hevc_vaapi $scale_filter $codec_mode \
+        -c:v hevc_vaapi -strict unofficial $scale_filter $codec_mode \
         -c:a aac -c:s copy "$output_path" > "$log_file" 2>&1 &
 }
 
@@ -150,37 +180,27 @@ show_progress() {
     echo "📂 Total video files found: $total_files"
     echo "----------------------------------"
 
-    # Move the cursor up to overwrite the progress area
-    echo -ne "\033[H"  # Move the cursor to the top
-    echo "----------------------------------"
-    echo " Encoding Progress:"
-    echo "----------------------------------"
-    echo "🖥️  Using $num_cores CPU cores."
-    echo "📂 Total video files found: $total_files"
-    echo "----------------------------------"
-
-    # Show encoding status for each container
+    # Show encoding status for each active container
+    echo "Active encoding containers:"
     for container_name in "${!active_containers[@]}"; do
         output_file="${active_containers[$container_name]}"
         aspect_ratio="Unknown"
 
-        # Check aspect ratio of output file if it exists
-        if [[ -f "$output_file" ]]; then
-            aspect_ratio=$(docker run --rm -v "$PWD":/media -w /media --network none --entrypoint ffprobe ffmpeg-vaapi \
-                -v error -select_streams v:0 -show_entries stream=display_aspect_ratio -of csv=p=0 "$output_file")
-        fi
+        # Check aspect ratio of output file
+        aspect_ratio=$(get_aspect_ratio "$output_file")
 
         status="Encoding 🔄"
         if ! docker ps --filter "name=$container_name" -q | grep -q .; then
             status="Completed ✅"
         fi
 
-        echo -e " 🎥 ${container_name} | Aspect Ratio: ${aspect_ratio} | Status: ${status} | File: ${output_file} "
+        # Only show active containers
+        if [[ "$status" == "Encoding 🔄" ]]; then
+            echo -e " 🎥 ${container_name} | Aspect Ratio: ${aspect_ratio} | Status: ${status} | File: ${output_file} "
+        fi
     done
     echo "----------------------------------"
 }
-
-
 
 # Main Encoding Loop
 IFS=$'\n' read -r -d '' -a files < <(find_video_files "$input_dir")
