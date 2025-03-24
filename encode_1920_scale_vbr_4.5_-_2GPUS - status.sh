@@ -100,16 +100,21 @@ declare -A active_containers
 # Function to handle Ctrl+C (SIGINT)
 cleanup_on_abort() {
     echo "Stopping running FFmpeg containers..."
-    
+
     # Stop all actively tracked containers and delete their incomplete output files
     for container_name in "${!active_containers[@]}"; do
         if docker ps --filter "name=$container_name" -q | grep -q .; then
+            echo "Stopping container: $container_name"
             docker stop "$container_name"
-            output_file="${active_containers[$container_name]}"
-            if [[ -f "$output_file" ]]; then
-                echo "Deleting incomplete file: $output_file"
-                rm -f "$output_file"
-            fi
+        fi
+
+        # Split the stored value into input_file and output_file
+        IFS='|' read -r input_file output_file <<< "${active_containers[$container_name]}"
+
+        # Delete the incomplete output file if it exists
+        if [[ -f "$output_file" ]]; then
+            echo "Deleting incomplete file: $output_file"
+            rm -f "$output_file"
         fi
     done
 
@@ -123,7 +128,7 @@ encode_vaapi() {
     local input_file="$2"
     local filename=$(basename "$input_file")
     local relative_path="${input_file#$input_dir/}"
-    local output_path="$output_dir/${relative_path%.*}.mkv"
+    local output_file="$output_dir/${relative_path%.*}.mkv"
     local log_file="$log_dir/${filename%.*}.log"
     local gpu_name="GPU1"
     [[ "$gpu_device" == "$gpu2" ]] && gpu_name="GPU2"
@@ -134,7 +139,7 @@ encode_vaapi() {
         #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=125:w=1920:h=1080:pitch=-30,format=nv12,hwupload"
         #scale_filter="v360=input=equirect:output=flat:ih_fov=180:iv_fov=180:h_fov=93:v_fov=110:in_stereo=sbs:w=1920:h=-1,format=nv12,hwupload"
         #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=150:w=1920:h=1080,format=nv12,hwupload"
-        scale_filter="-noautoscale -vf v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=143,format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+        scale_filter="-noautoscale -vf v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=143:w=1920:h=1080,format=nv12,hwupload"
         #scale_filter="v360=input=equirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=153:w=1920:h=1080,format=nv12,hwupload"
     else
         # Aspect ratio check
@@ -161,13 +166,18 @@ encode_vaapi() {
 
     container_count=$((container_count + 1))
     local container_name="ffmpeg_${gpu_name}_${container_count}"
-    active_containers["$container_name"]="$output_path"
+
+    # Store both input and output file paths in the active_containers array
+    active_containers["$container_name"]="$input_file|$output_file"
 
     docker run --rm --device /dev/dri -v "$PWD":/media -w /media --network none --name "$container_name" ffmpeg-vaapi \
-        -hide_banner -loglevel info -hwaccel vaapi \
-        -init_hw_device vaapi=amd0:"$gpu_device" -i "$input_file" \
+        -hide_banner -loglevel info \
+        -hwaccel vaapi -init_hw_device vaapi=amd0:"$gpu_device" \
+        -i "$input_file" \
         -c:v hevc_vaapi -strict unofficial $scale_filter $codec_mode \
-        -c:a aac -c:s copy "$output_path" > "$log_file" 2>&1 &
+        -threads "$num_cores" \
+        -max_muxing_queue_size 2048 \
+        -c:a aac -c:s copy "$output_file" > "$log_file" 2>&1 &
 }
 
 # Function to show live progress while preserving static header
@@ -183,11 +193,14 @@ show_progress() {
     # Show encoding status for each active container
     echo "Active encoding containers:"
     for container_name in "${!active_containers[@]}"; do
-        output_file="${active_containers[$container_name]}"
-        aspect_ratio="Unknown"
+        # Split the stored value into input_file and output_file
+        IFS='|' read -r input_file output_file <<< "${active_containers[$container_name]}"
 
-        # Check aspect ratio of output file
-        aspect_ratio=$(get_aspect_ratio "$output_file")
+        # Get aspect ratio from the input file
+        aspect_ratio="Unknown"
+        if [[ -f "$input_file" ]]; then
+            aspect_ratio=$(get_aspect_ratio "$input_file")
+        fi
 
         status="Encoding 🔄"
         if ! docker ps --filter "name=$container_name" -q | grep -q .; then
