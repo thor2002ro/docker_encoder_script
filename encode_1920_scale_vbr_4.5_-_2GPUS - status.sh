@@ -139,20 +139,20 @@ encode_vaapi() {
         #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=125:w=1920:h=1080:pitch=-30,format=nv12,hwupload"
         #scale_filter="v360=input=equirect:output=flat:ih_fov=180:iv_fov=180:h_fov=93:v_fov=110:in_stereo=sbs:w=1920:h=-1,format=nv12,hwupload"
         #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=150:w=1920:h=1080,format=nv12,hwupload"
-        scale_filter="-noautoscale -vf v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=143:w=1920:h=1080,format=nv12,hwupload"
+        scale_filter="-vaapi_device $gpu_device -noautoscale -vf v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=143:w=1920:h=1080,format=nv12,hwupload"
         #scale_filter="v360=input=equirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=153:w=1920:h=1080,format=nv12,hwupload"
     else
         # Aspect ratio check
         local aspect_ratio=$(get_aspect_ratio "$input_file")
     
-        scale_filter="-filter_hw_device amd0 -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+        scale_filter="-vaapi_device $gpu_device -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
         local numerator=$(echo "$aspect_ratio" | awk -F: '{print $1}')
         local denominator=$(echo "$aspect_ratio" | awk -F: '{print $2}')
 
         if (( numerator > denominator )); then
-            scale_filter="-filter_hw_device amd0 -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+            scale_filter="-vaapi_device $gpu_device -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
         else
-            scale_filter="-filter_hw_device amd0 -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1080:h=-2:format=nv12:mode=2"
+            scale_filter="-vaapi_device $gpu_device -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1080:h=-2:format=nv12:mode=2"
         fi
     fi
 
@@ -162,7 +162,7 @@ encode_vaapi() {
     #codec_mode="-rc_mode CQP -qp 26 -compression_level 1"
     #codec_mode="-rc_mode CQP -global_quality 24 -compression_level 1 "
     #codec_mode="-rc_mode VBR -b:v 1.5M -maxrate 5M -compression_level 1"
-    codec_mode="-qp 27 -bf 0 -preset medium -compression_level 1"
+    codec_mode="-c:v hevc_vaapi -qp 27 -bf 0 -preset medium -compression_level 1"
 
     container_count=$((container_count + 1))
     local container_name="ffmpeg_${gpu_name}_${container_count}"
@@ -172,9 +172,9 @@ encode_vaapi() {
 
     docker run --rm --device /dev/dri -v "$PWD":/media -w /media --network none --name "$container_name" ffmpeg-vaapi \
         -hide_banner -loglevel info \
-        -hwaccel vaapi -init_hw_device vaapi=amd0:"$gpu_device" \
         -i "$input_file" \
-        -c:v hevc_vaapi -strict unofficial $scale_filter $codec_mode \
+        $scale_filter $codec_mode \
+        -strict unofficial \
         -threads "$num_cores" \
         -max_muxing_queue_size 2048 \
         -c:a aac -c:s copy "$output_file" > "$log_file" 2>&1 &
