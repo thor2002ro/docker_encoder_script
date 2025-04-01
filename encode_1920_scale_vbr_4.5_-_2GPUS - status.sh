@@ -20,7 +20,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # Number of containers per GPU
-container_nr=2
+container_nr=6
 if [[ -n $software_mode ]]; then
     container_nr=2  
 fi
@@ -108,8 +108,9 @@ cleanup_on_abort() {
             docker stop "$container_name"
         fi
 
-        # Split the stored value into input_file and output_file
-        IFS='|' read -r input_file output_file <<< "${active_containers[$container_name]}"
+        # Extract input_file, output_file, and aspect_ratio
+        IFS='|' read -r input_file output_file aspect_ratio log_file <<< "${active_containers[$container_name]}"
+
 
         # Delete the incomplete output file if it exists
         if [[ -f "$output_file" ]]; then
@@ -133,26 +134,29 @@ encode_vaapi() {
     local gpu_name="GPU1"
     [[ "$gpu_device" == "$gpu2" ]] && gpu_name="GPU2"
 
+    # Aspect ratio check
+    local aspect_ratio=$(get_aspect_ratio "$input_file")
+
     local scale_filter=""
+    local hw_accel=""
     if [[ -n $vr_mode ]]; then
+        hw_accel="-vaapi_device $gpu_device"
         #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=125:w=1920:h=1080:pitch=-30,scale=1920:1080,format=nv12,hwupload"
         #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=125:w=1920:h=1080:pitch=-30,format=nv12,hwupload"
         #scale_filter="v360=input=equirect:output=flat:ih_fov=180:iv_fov=180:h_fov=93:v_fov=110:in_stereo=sbs:w=1920:h=-1,format=nv12,hwupload"
         #scale_filter="v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=150:w=1920:h=1080,format=nv12,hwupload"
-        scale_filter="-vaapi_device $gpu_device -noautoscale -vf v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=143:w=1920:h=1080,format=nv12,hwupload"
+        scale_filter="-noautoscale -vf v360=input=hequirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=143:w=1920:h=1080,format=nv12,hwupload"
         #scale_filter="v360=input=equirect:output=flat:in_stereo=sbs:out_stereo=2d:d_fov=153:w=1920:h=1080,format=nv12,hwupload"
     else
-        # Aspect ratio check
-        local aspect_ratio=$(get_aspect_ratio "$input_file")
-    
-        scale_filter="-vaapi_device $gpu_device -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+        hw_accel="-hwaccel vaapi -vaapi_device $gpu_device"
+        scale_filter="-noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
         local numerator=$(echo "$aspect_ratio" | awk -F: '{print $1}')
         local denominator=$(echo "$aspect_ratio" | awk -F: '{print $2}')
 
         if (( numerator > denominator )); then
-            scale_filter="-vaapi_device $gpu_device -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
+            scale_filter="-noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1920:h=-2:format=nv12:mode=2"
         else
-            scale_filter="-vaapi_device $gpu_device -noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1080:h=-2:format=nv12:mode=2"
+            scale_filter="-noautoscale -vf format=nv12|vaapi,hwupload,scale_vaapi=w=1080:h=-2:format=nv12:mode=2"
         fi
     fi
 
@@ -167,11 +171,12 @@ encode_vaapi() {
     container_count=$((container_count + 1))
     local container_name="ffmpeg_${gpu_name}_${container_count}"
 
-    # Store both input and output file paths in the active_containers array
-    active_containers["$container_name"]="$input_file|$output_file"
+    # Store input file, output file, and aspect ratio
+    active_containers["$container_name"]="$input_file|$output_file|$aspect_ratio|$log_file"
 
     docker run --rm --device /dev/dri -v "$PWD":/media -w /media --network none --name "$container_name" ffmpeg-vaapi \
         -hide_banner -loglevel info \
+        $hw_accel \
         -i "$input_file" \
         $scale_filter $codec_mode \
         -strict unofficial \
@@ -180,9 +185,12 @@ encode_vaapi() {
         -c:a aac -c:s copy "$output_file" > "$log_file" 2>&1 &
 }
 
-# Function to show live progress while preserving static header
 show_progress() {
-    # Print static header at the top of the screen
+    clear
+    # Save the current cursor position to avoid `clear` flickering
+    tput civis   # Hide the cursor
+    tput cup 0 0 # Move the cursor to the top-left corner of the terminal
+
     echo "----------------------------------"
     echo " Encoding Progress:"
     echo "----------------------------------"
@@ -190,29 +198,38 @@ show_progress() {
     echo "📂 Total video files found: $total_files"
     echo "----------------------------------"
 
-    # Show encoding status for each active container
-    echo "Active encoding containers:"
+    # Check the status of all active containers
     for container_name in "${!active_containers[@]}"; do
-        # Split the stored value into input_file and output_file
-        IFS='|' read -r input_file output_file <<< "${active_containers[$container_name]}"
+        IFS='|' read -r input_file output_file aspect_ratio log_file <<< "${active_containers[$container_name]}"
 
-        # Get aspect ratio from the input file
-        aspect_ratio="Unknown"
-        if [[ -f "$input_file" ]]; then
-            aspect_ratio=$(get_aspect_ratio "$input_file")
-        fi
-
+        # Check if container is active
         status="Encoding 🔄"
         if ! docker ps --filter "name=$container_name" -q | grep -q .; then
             status="Completed ✅"
+            unset active_containers["$container_name"]
         fi
 
-        # Only show active containers
-        if [[ "$status" == "Encoding 🔄" ]]; then
-            echo -e " 🎥 ${container_name} | Aspect Ratio: ${aspect_ratio} | Status: ${status} | File: ${output_file} "
+        # Fetch current progress
+        local current_time=""
+        local speed=""
+        local total_time=""
+        if [[ -f "$log_file" ]]; then
+            current_time=$(sed -n 's/.*time=\([0-9:.]\+\).*/\1/p' "$log_file" | sed -n '$p')
+            speed=$(sed -n 's/.*speed=\([0-9.]\+\).*/\1/p' "$log_file" | sed -n '$p')
+            total_time=$(sed -n 's/.*Duration: \([0-9:.]*\),.*/\1/p' "$log_file" | sed -n '$p')
         fi
+
+        # Output progress details
+        [[ -z "$current_time" ]] && current_time="⏳ Pending"
+        [[ -z "$speed" ]] && speed="N/A"
+
+        echo -e "🎥 ${container_name} | Aspect Ratio: ${aspect_ratio} | Status: ${status} | Progress: $current_time / $total_time | Speed: $speed"
     done
     echo "----------------------------------"
+
+    # Restore the cursor visibility
+    tput el   # Clear to the end of the current line
+    tput cnorm # Show the cursor again
 }
 
 # Main Encoding Loop
@@ -224,34 +241,38 @@ i=0
 create_output_structure "$input_dir" "$output_dir"
 
 while [ $i -lt $total_files ]; do
-    running_containers_gpu1=$(check_running_containers "GPU1")
+    # running_containers_gpu1=$(check_running_containers "GPU1")
     running_containers_gpu2=$(check_running_containers "GPU2")
 
-    if [ $running_containers_gpu1 -lt $container_nr ] && [ $i -lt $total_files ]; then
-        encode_vaapi $gpu1 "${files[$i]}"
-        sleep 1
-        (( i++ ))
-    fi
+    # echo $running_containers_gpu1
+    # echo $running_containers_gpu2
+
+    started=false  # Flag to track if any encoding started in this loop iteration
+
+    # if [ $running_containers_gpu1 -lt $container_nr ] && [ $i -lt $total_files ]; then
+    #     encode_vaapi $gpu1 "${files[$i]}"
+    #     sleep 1  # Small delay to allow proper startup
+    #     (( i++ ))
+    #     started=true
+    # fi
 
     if [ $running_containers_gpu2 -lt $container_nr ] && [ $i -lt $total_files ]; then
         encode_vaapi $gpu2 "${files[$i]}"
         sleep 1
         (( i++ ))
-    fi
-    running_containers_gpu1=$(check_running_containers "GPU1")
-    running_containers_gpu2=$(check_running_containers "GPU2")
-
-    clear
-    show_progress  
-
-    if (( running_containers_gpu1 >= container_nr )) || (( running_containers_gpu2 >= container_nr )); then
-        wait -n
-        running_containers_gpu1=$(check_running_containers "GPU1")
-        running_containers_gpu2=$(check_running_containers "GPU2")
+        started=true
     fi
 
-  
+    # If no new encoding started and both GPUs are at full capacity, wait for a slot
+    # if [ "$started" = false ]; then
+    #     wait -n  # Wait for at least one encoding process to complete
+    # fi
+    if [ "$started" = false ]; then
+        show_progress
+        sleep 5
+    fi
 done
+
 
 wait
 echo "Encoding complete! 🎉"
